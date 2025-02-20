@@ -59,7 +59,7 @@ class jvp_MLP(nn.Module):
                 if l < len(self.linear_layers)-1:
                     layer.fwd_method = 'W^T'
                     # set W_next for all layers except last
-                    layer.W_next = self.linear_layers[l+1].weight
+                    layer.W_next = self.linear_layers[l+1].weight.clone()
                 if l == len(self.linear_layers)-1:
                     layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]))  # B x out
                     layer.fwd_method = 'act_perturb'
@@ -143,7 +143,8 @@ class jvp_linear(nn.Module):
             mixture = alphas @ x_in # B, in
             mixture *= (x_in>0) # relu mask
             # normalise to match the norm of a randn sampled guess? expected norm = sqrt(n)
-            self.x_guess = mixture*(torch.prod(torch.tensor(mixture.shape)).sqrt())/mixture.norm()
+            self.x_guess = mixture * (torch.tensor(mixture.shape[1], dtype=torch.float32).sqrt()) / (
+                (mixture**2).sum(dim=1).sqrt()).unsqueeze(-1)
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in + self.x_guess,))
             jvp_out = jvp + self.s_guess
         elif self.fwd_method == 'layer_downstream':
@@ -152,7 +153,8 @@ class jvp_linear(nn.Module):
             with torch.enable_grad():
                 s_next = F.relu(F.linear(F.relu(s_i), self.weight_next, self.bias_next))
                 s_next.backward(gradient=torch.randn_like(s_next))
-                self.s_guess = s_i.grad*(torch.prod(torch.tensor(s_i.shape)).sqrt())/s_i.grad.norm()
+                self.s_guess = s_i.grad * (torch.tensor(s_i.grad.shape[1], dtype=torch.float32).sqrt()) / ((s_i.grad**2).sum(dim=1).sqrt()).unsqueeze(-1)
+
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
             return out, jvp_out
@@ -161,7 +163,9 @@ class jvp_linear(nn.Module):
             self.s_guess = (s_next_guess @ self.W_next) * (
                     (F.linear(x_in, self.weight, self.bias)) > 0) # relu mask
             #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
-            self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
+            #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
+            self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
         return out, jvp_out
@@ -176,7 +180,7 @@ class jvp_loss(nn.Module):
         return self.loss_fn(x, y)
 
     def func(self, x):
-        return self.loss_fn(x, self.y)
+        return self.loss_fn(x, self.y)/x.shape[0]
 
     def jvp_forward(self, x_in, jvp_in):
         out, jvp_out = fc.jvp(self.func, (x_in,), (jvp_in,))

@@ -13,6 +13,7 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 import json
+print('importing network from network.py')
 device = 'cpu'
 
 transform = transforms.Compose([
@@ -82,9 +83,12 @@ def act_perturb(method, n_epochs):
                         continue
                 optimizer.zero_grad()
                 loss, jvp = model.jvp_forward(x, y.to(device))
-                #print(jvp.mean())
+                #print(jvp)
                 train_losses.append(loss.mean().item())
                 model.set_grad(jvp)
+                fwd_grads = {name: param.grad.clone() for name, param in model.named_parameters()}
+                #for name, param in model.named_parameters():
+                #    print(name, fwd_grads[name])
                 # Optimizer step
                 optimizer.step()
 
@@ -98,37 +102,55 @@ def act_perturb(method, n_epochs):
                 print(method, epoch, np.array(test_loss).mean(),  np.array(accuracy).mean())
             test_losses.append(np.array(test_loss).mean())
             test_accuracies.append(np.array(accuracy).mean())
+            if epoch % 50 == 0:
+                torch.save(model.state_dict(), f'model_checkpoints/{method}_epoch_{epoch}')
         #wandb.finish()
         return test_losses, test_accuracies
 
 
-train = False
+train = True
 plot = True
 
+'''
+normalise per-batch
+W^T: 58.5%
+act_mixing: 55.0%
+layer_downstream: 61.9%
+
+also divide loss by batch size
+W^T: 60.4%
+act_mixing: 55.0%
+layer_downstream: 61.9%
+
+W^T: 61.6%
+act_mixing: 52.8%
+layer_downstream: 63.5%
+'''
+
+dir = 'results_2'
 if train:
     losses = {}
     accuracies = {}
     n_epochs = 1000
     methods = ['W^T', 'act_mixing', 'layer_downstream', 'act_perturb', 'weight_perturb', 'backprop']
-    methods = ['W^T', 'act_mixing', 'layer_downstream']
+    methods = ['layer_downstream', 'act_mixing', 'W^T']
     for method in methods:
         train_losses, train_accuracies = act_perturb(method, n_epochs=n_epochs)
         losses[f'{method} train losses'] = [float(loss) for loss in train_losses]
         accuracies[f'{method} train accuracies'] = [float(acc) for acc in train_accuracies]
-        with open(f'{method}_losses.json', 'w') as f:
+        with open(f'{dir}/{method}_losses.json', 'w') as f:
             json.dump(losses, f)
-        with open(f'{method}_accuracies.json', 'w') as g:
+        with open(f'{dir}/{method}_accuracies.json', 'w') as g:
             json.dump(accuracies, g)
 
 if plot:
-    fir = 'results_1'
     losses, accuracies = {}, {}
     methods = ['W^T', 'act_mixing', 'layer_downstream', 'act_perturb', 'weight_perturb', 'backprop']
     for method in methods:
-        with open(f'{fir}/{method}_losses.json', 'r') as f:
+        with open(f'{dir}/{method}_losses.json', 'r') as f:
             dict = json.load(f)
         losses[f'{method} train losses'] = dict[f'{method} train losses']
-        with open(f'{fir}/{method}_accuracies.json', 'r') as g:
+        with open(f'{dir}/{method}_accuracies.json', 'r') as g:
             dict2 = json.load(g)
         accuracies[f'{method} train accuracies'] = dict2[f'{method} train accuracies']
         final_accuracy = dict2[f'{method} train accuracies'][-1]

@@ -13,6 +13,8 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 import json
+from pyhessian import hessian
+
 print('importing network from network.py')
 device = 'cpu'
 
@@ -36,7 +38,6 @@ def test_act_perturb(model, dataloader):
         x, y = batch
         N, C, H, W = x.shape
         x = torch.reshape(x, (N, C*H * W)).to(device)
-
         out = model.forward(x)
         loss = F.cross_entropy(out, y.to(device))
         losses.append(loss.item())
@@ -76,6 +77,7 @@ def act_perturb(method, n_epochs):
                 ###
                 optimizer.zero_grad()
                 loss, jvp = model.jvp_forward(x, y.to(device))
+
                 #print(jvp)
                 train_losses.append(loss.mean().item())
                 model.set_grad(jvp)
@@ -85,7 +87,18 @@ def act_perturb(method, n_epochs):
                 # Optimizer step
                 optimizer.step()
                 layer_metrics = compute_bias(model, x, y, jvp)
+                top_eigenvalues = compute_hessian(model, x, y)
+                #layer_metrics['top_eigenvalues'] = top_eigenvalues
+                layer_metrics.update(top_eigenvalues)
+                layer_metrics.update({"train_loss": loss.sum().item()})
                 wandb.log(layer_metrics)
+                # backprop
+                with torch.enable_grad():
+                    out = model(x)
+                    loss = F.cross_entropy(out, y)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
             test = False
             if test:
                 test_loss, accuracy = test_act_perturb(model, train_dataloader)
@@ -97,7 +110,7 @@ def act_perturb(method, n_epochs):
                 test_accuracies.append(np.array(accuracy).mean())
             if epoch % 50 == 0:
                 torch.save(model.state_dict(), f'model_checkpoints/W^T_bias_epoch_{epoch}')
-        #wandb.finish()
+        wandb.finish()
         return test_losses, test_accuracies
 
 def compute_bias(model, x, y, jvp):
@@ -117,17 +130,19 @@ def compute_bias(model, x, y, jvp):
         # for y=mask*(W^Te), cov(y) = mask @ W^TW @ mask where mask is a diagonal matrix
         dL = backprop_grads[l] # (B, out)
         B, out = dL.shape
-        cov_WT = layer.W_next.T @ layer.W_next
+        cov_WT = layer.W_next.T @ layer.W_next # out, out
         mask = torch.diag_embed(layer.mask).to(torch.float32)
         cov_y = mask @ cov_WT @ mask  # (B, out, out)
         bias = (dL.unsqueeze(1)@(cov_y - torch.eye(cov_y.shape[-1]))).squeeze().mean(dim=0) # (B, out)
         #print(bias)
     # compute MSE
         dL_guess = jvp.unsqueeze(-1)*layer.s_guess
-        #print((torch.tensor(np.cov(dL_guess, rowvar=False))-cov_y).mean())
+        #print((torch.tensor(np.cov(dL_guess, rowvar=False))-cov_WT).mean())
+        bias2 = (dL_guess - dL).mean(dim=0)
+        #print(bias, bias2.mean(dim=0))
         mse = ((dL_guess - dL)**2).mean(dim=0)
         var = mse - bias**2
-        var2 = dL_guess.var(dim=0)
+        #var2 = dL_guess.var(dim=0)
         #print((var - var2).mean())
         layer_metrics[f'layer_{l+1}_mse'] = mse.mean()
         layer_metrics[f'layer_{l+1}_var'] = var.mean()
@@ -135,6 +150,17 @@ def compute_bias(model, x, y, jvp):
         #print(mse.mean(), var.mean(), (bias).mean(), var.min())
     return layer_metrics
 
+# compute top k hessian eigenvalues and eigenvectors using pyhessian
+def compute_hessian(model, x, y):
+    top_hessian_eigenvalues = {}
+    with torch.enable_grad():
+        hessian_comp = hessian(model, criterion=nn.CrossEntropyLoss(), data=(x, y), cuda=False)
+        top_eigenvalues, top_eigenvectors = hessian_comp.eigenvalues(top_n=15)
+        print(top_eigenvalues)
+        #print(top_eigenvectors[0])
+        for v, value in enumerate(sorted(top_eigenvalues)):
+            top_hessian_eigenvalues[f'eigenvalue_{v}'] = value
+    return top_hessian_eigenvalues
 
 train = True
 plot = False

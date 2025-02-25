@@ -105,7 +105,7 @@ class jvp_linear(nn.Module):
         elif self.fwd_method == 'W^T':
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0])
             self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
-            self.s_guess = (s_next_guess @ self.W_next) #* self.mask # relu mask
+            self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
             #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
             #self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))

@@ -76,7 +76,7 @@ def act_perturb(methods, n_epochs):
         }
     )
     model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
-                out_size=10, hidden_size=[128, 128, 128], method='W^T')
+                out_size=10, hidden_size=[1024, 1024, 1024], method='W^T')
     model.to(device)
     params_to_optimize = [
         param for name, param in model.named_parameters()
@@ -143,6 +143,15 @@ def compute_gradient(model, optimizer, x, y):
         # for param in model.output_gradients:
         #    print(param.shape)
         act_grads = [param.detach().clone() for param in model.output_gradients][:-1]
+
+        '''
+        check jvp computation: dot(dL, dL_guess) = jvp
+        dLs = torch.cat([param[0].detach().clone() for param in model.output_gradients])
+        loss, jvp = model.jvp_forward(x.to(device), y.to(device))
+        dLs_guess = torch.cat([layer.s_guess[0] for layer in model.linear_layers])
+        print(torch.dot(dLs, dLs_guess))
+        print(jvp[0])
+        '''
         parameters_grads = {}
         for p, param in model.named_parameters():
             if 'bias' not in p:
@@ -167,7 +176,7 @@ def compute_bias(dL, layer, method):
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
             cov_y = mask @ cov_WT @ mask  # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)  #torch.linalg.det(cov_y.cpu()).mean()
+            return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]  #torch.linalg.det(cov_y.cpu()).mean()
         elif method == 'act_perturb-relu':
             #cov_WT = layer.W_next.T @ layer.W_next  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
@@ -209,10 +218,10 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                 #var2 = dL_guess.var(dim=0)
                 #print((var - var2).mean())
                 layer_metrics[f'{method}_layer_{l+1}_mse'] = mse.mean()
-                layer_metrics[f'{method}_layer_{l+1}_var_linf'] = var.abs().max()
-                layer_metrics[f'{method}_layer_{l+1}_var_linf'] = torch.linalg.norm(var)
+                layer_metrics[f'{method}_layer_{l+1}_var_l_inf'] = var.abs().max()
+                layer_metrics[f'{method}_layer_{l+1}_var_l2'] = torch.linalg.norm(var)
                 layer_metrics[f'{method}_layer_{l + 1}_cov_trace'] = cov_trace.mean().cpu()
-                layer_metrics[f'{method}_layer_{l+1}_bias_linf'] = bias.abs().max()
+                layer_metrics[f'{method}_layer_{l+1}_bias_l_inf'] = bias.abs().max()
                 layer_metrics[f'{method}_layer_{l+1}_bias_l2'] = torch.linalg.norm(bias)
                 layer_metrics[f'{method}_layer_{l+1}_cov_forbenius_norm'] = cov_frob
                 #print(mse.mean(), var.mean(), (bias).mean(), var.min())

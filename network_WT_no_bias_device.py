@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torch.func as fc
 import math
 
-print('imported no bias network')
 device = 'mps'
 class jvp_MLP(nn.Module):
     def __init__(self, in_size, out_size, hidden_size=[128, 128, 128], method='weight_perturb'):

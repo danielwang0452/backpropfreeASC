@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,12 +57,14 @@ class jvp_MLP(nn.Module):
             elif self.method == 'act_perturb' or self.method == 'act_perturb-relu':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]), device=device) # B x out
                 layer.fwd_method = 'act_perturb'
-            elif self.method == 'W^T':
-                if l < len(self.linear_layers)-1:
+            elif self.method in ['W^T', 'CW^T']:
+                if l < len(self.linear_layers) - 1:
                     layer.fwd_method = 'W^T'
+                    if self.method == 'CW^T':
+                        layer.fwd_method = 'CW^T'
                     # set W_next for all layers except last
-                    layer.W_next = self.linear_layers[l+1].weight.clone()
-                if l == len(self.linear_layers)-1:
+                    layer.W_next = self.linear_layers[l + 1].weight.clone()
+                if l == len(self.linear_layers) - 1:
                     layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]), device=device)  # B x out
                     layer.fwd_method = 'act_perturb'
             elif self.method == 'act_mixing':
@@ -86,11 +89,12 @@ class jvp_MLP(nn.Module):
         for l, layer in enumerate(self.linear_layers):
             if self.method == 'weight_perturb':
                 layer.weight.grad = jvp.sum() * layer.weight_guess
-            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'layer_downstream']:
+            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'layer_downstream']:
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
                 ).sum(dim=0)
+                layer.bias.grad = scaled_s_guess.sum(dim=0)
                 # with torch.enable_grad():
                 #    s = F.linear(self.x_in, self.weight, self.bias)
                 #    s.backward(gradient=jvp.unsqueeze(-1)*self.s_guess)
@@ -157,14 +161,24 @@ class jvp_linear(nn.Module):
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
             return out, jvp_out
-        elif self.fwd_method == 'W^T':
+        elif self.fwd_method in ['W^T', 'CW^T']:
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0], device=device)
-            self.mask = ((F.linear(x_in, self.weight, bias=None)) > 0)
-            self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
-            #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
-            #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
-            self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
-            #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
+            self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
+            if self.fwd_method == 'W^T':
+                self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
+                #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
+                #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
+                self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            elif self.fwd_method == 'CW^T':
+                cov_WT = (self.W_next.T @ self.W_next)  # out, out
+                mask = torch.diag_embed(self.mask).to(torch.float32)
+                cov_y = (mask @ cov_WT @ mask) + 1e-5*self.eye
+                L, Q = torch.linalg.eigh(cov_y)
+                self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-1))), Q.permute((0, 2, 1))) # (B, out, out)
+                #self.s_guess1 = torch.bmm(self.C_pow, ((s_next_guess @ self.W_next) * self.mask).unsqueeze(-1)).squeeze() # relu mask
+                #assert self.C[0] @ cov_y[0] == self.eye
+                self.s_guess = torch.bmm(((s_next_guess @ self.W_next) * self.mask).unsqueeze(1), self.C).squeeze()
+                #print(self.s_guess2 - self.s_guess1)
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
         elif self.fwd_method == 'act_perturb-relu':

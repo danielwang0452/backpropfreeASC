@@ -1,3 +1,6 @@
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import copy
 import torch
 import torch.nn.functional as F
@@ -75,14 +78,19 @@ def act_perturb(methods, n_epochs):
             "epochs": n_epochs,
         }
     )
+    size = 128
     model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
-                out_size=10, hidden_size=[1024, 1024, 1024], method='W^T')
+                out_size=10, hidden_size=[size, size, size])
+    model_backprop = copy.deepcopy(model)
+    model_backprop.to(device)
     model.to(device)
+    model.method = 'CW^T'
     params_to_optimize = [
         param for name, param in model.named_parameters()
     ]
     # Create the optimizer with the filtered parameters
     optimizer = torch.optim.AdamW(params_to_optimize, lr=1e-4)
+    optimizer_backprop = torch.optim.AdamW(model_backprop.parameters(), lr=1e-4)
     test_losses = []
     test_accuracies = []
     train_losses = []
@@ -95,7 +103,9 @@ def act_perturb(methods, n_epochs):
             if test:
                 train_loss, train_accuracy = test_act_perturb(model, train_dataloader)
                 test_loss, test_accuracy = test_act_perturb(model, test_dataloader)
-                print(method, epoch, np.array(train_loss).mean(), np.array(train_accuracy).mean())
+                train_loss_b, train_accuracy_b = test_act_perturb(model_backprop, train_dataloader)
+                test_loss_b, test_accuracy_b = test_act_perturb(model_backprop, test_dataloader)
+                print(model.method, epoch, np.array(train_loss).mean(), np.array(train_accuracy).mean())
                 test_losses.append(np.array(test_loss).mean())
                 test_accuracies.append(np.array(test_accuracy).mean())
                 train_losses.append(np.array(train_loss).mean())
@@ -103,7 +113,6 @@ def act_perturb(methods, n_epochs):
             for b, batch in enumerate(train_dataloader):
                 torch.mps.empty_cache()
                 #print(torch.mps.current_allocated_memory(), torch.mps.driver_allocated_memory())
-                model.method = 'W^T'
                 x, y = batch
                 x = x.to(device)
                 y = y.to(device)
@@ -113,6 +122,13 @@ def act_perturb(methods, n_epochs):
                 ###
                 optimizer.zero_grad()
                 loss, jvp = model.jvp_forward(x.to(device), y.to(device))
+                # backprop
+                with torch.enable_grad():
+                    out = model_backprop(x)
+                    loss2 = F.cross_entropy(out, y)
+                    optimizer_backprop.zero_grad()
+                    loss2.backward()
+                    optimizer_backprop.step()
 
                 #print(jvp)
                 #train_losses.append(loss.mean().item())
@@ -120,10 +136,15 @@ def act_perturb(methods, n_epochs):
                 # Optimizer step
                 optimizer.step()
                 layer_metrics = compute_layer_metrics(model, optimizer, x, y, methods)
-                layer_metrics["train_accuracy"] = np.array(train_accuracy).mean()
-                layer_metrics["test_accuracy"] = np.array(test_accuracy).mean()
+                #layer_metrics[f"{model.method}_train_accuracy"] = np.array(train_accuracy).mean()
+                #layer_metrics[f"{model.method}_test_accuracy"] = np.array(test_accuracy).mean()
+                layer_metrics[f"W^T_train_accuracy"] = np.array(train_accuracy).mean()
+                layer_metrics[f"W^T_test_accuracy"] = np.array(test_accuracy).mean()
+                layer_metrics["backprop_train_accuracy"] = np.array(train_accuracy_b).mean()
+                layer_metrics["backprop_test_accuracy"] = np.array(test_accuracy_b).mean()
                 wandb.log(layer_metrics)
-            #torch.save(model.state_dict(), f'model_checkpoints/W^T')
+            if epoch % 100 == 0:
+                torch.save(model.state_dict(), f'model_checkpoints/{model.method}_{size}_{epoch}')
             #model = None
             #model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
             #                out_size=10, hidden_size=[1024, 1024, 1024], method='W^T')
@@ -163,13 +184,13 @@ def compute_gradient(model, optimizer, x, y):
     return act_grads, parameters_grads
 
 def compute_bias(dL, layer, method):
-    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T']
+    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T']
     with torch.no_grad():
         if method == 'weight_perturb' or method == 'act_perturb':
             # unbiased
             return torch.tensor(0, dtype=torch.float32).cpu(), \
-                torch.prod(torch.tensor(layer.weight.shape, dtype=torch.float32)).sqrt().cpu(), \
-                torch.tensor(layer.weight.shape[0], dtype=torch.float32).cpu()
+                torch.tensor(0, dtype=torch.float32).cpu(), \
+                torch.tensor(0, dtype=torch.float32).cpu()
         elif method == 'W^T':
             # for y=mask*(W^Te), cov(y) = mask @ W^TW @ mask where mask is a diagonal matrix
             cov_WT = (layer.W_next.T.detach() @ layer.W_next.detach())  # out, out
@@ -177,12 +198,29 @@ def compute_bias(dL, layer, method):
             cov_y = mask @ cov_WT @ mask  # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
             return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]  #torch.linalg.det(cov_y.cpu()).mean()
+        elif method == 'CW^T':
+            # for y=C@mask*(W^Te), cov(y) = C @ mask @ W^TW @ mask @ C^Twhere mask is a diagonal matrix
+            cov_WT = (layer.W_next.T.detach() @ layer.W_next.detach())  # out, out
+            mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
+            cov_y = torch.bmm(layer.C, torch.bmm((mask @ cov_WT @ mask + 1e-5*layer.eye), layer.C))  # (B, out, out)
+            #cov_y = torch.bmm(layer.C, (mask @ cov_WT @ mask + 1e-5*layer.eye))
+            bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
+            cov_y1 = mask @ cov_WT @ mask + 1e-5*layer.eye
+
+            return bias.cpu(), ((torch.bmm(cov_y, cov_y1) - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]
         elif method == 'act_perturb-relu':
             #cov_WT = layer.W_next.T @ layer.W_next  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
             cov_y = mask # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
             return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y) #torch.linalg.det(cov_y.cpu()).mean()
+
+def compute_cosine_sim(dL, dL_guess):
+    cos_sim_fn = nn.CosineSimilarity(dim=1)
+    cos_sim = cos_sim_fn(dL, dL_guess).mean().cpu()
+    cos_sim_shifted = cos_sim_fn((dL-dL.mean(dim=1, keepdim=True)), (dL_guess-dL_guess.mean(dim=1, keepdim=True))).mean().cpu()
+    cos_sim_scaled = torch.tensor(dL_guess.shape[1], dtype=torch.float32).sqrt()*cos_sim_fn(dL, dL_guess).mean().cpu()
+    return cos_sim, cos_sim_shifted, cos_sim_scaled
 
 def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'act_perturb', 'act_perturb-relu', 'W^T']):
     # compute the true gradient
@@ -201,7 +239,7 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
 
             for l, layer in enumerate(model.linear_layers[:-1]): # omit output layer
             # compute MSE
-                if method == 'weight_perturb':
+                if layer.fwd_method == 'weight_perturb':
                     #dLs = [parameters_grads[f'net.{l * 2}.bias'].flatten(),
                     dLs = [parameters_grads[f'net.{l * 2}.weight'].flatten()]
                     dL = torch.cat(dLs, dim=0) # (B, out)
@@ -210,20 +248,38 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                 else:
                     dL = act_grads[l]  # (B, out)
                     dL_guess = (jvp.unsqueeze(-1)*layer.s_guess).detach()
-                bias, cov_frob, cov_trace = compute_bias(dL, layer, method)
+                    cosine_sim, cosine_sim_shifted, cosine_sim_scaled = compute_cosine_sim(dL, dL_guess)
+                bias, cov_frob, cov_trace = compute_bias(dL, layer, layer.fwd_method)
                 #print((torch.tensor(np.cov(dL_guess, rowvar=False))-cov_WT).mean())
                 #print(dL.mean(), dL_guess.mean())
                 mse = ((dL_guess - dL)**2).mean(dim=0).cpu()
                 var = mse - bias**2
                 #var2 = dL_guess.var(dim=0)
                 #print((var - var2).mean())
-                layer_metrics[f'{method}_layer_{l+1}_mse'] = mse.mean()
-                layer_metrics[f'{method}_layer_{l+1}_var_l_inf'] = var.abs().max()
-                layer_metrics[f'{method}_layer_{l+1}_var_l2'] = torch.linalg.norm(var)
-                layer_metrics[f'{method}_layer_{l + 1}_cov_trace'] = cov_trace.mean().cpu()
-                layer_metrics[f'{method}_layer_{l+1}_bias_l_inf'] = bias.abs().max()
-                layer_metrics[f'{method}_layer_{l+1}_bias_l2'] = torch.linalg.norm(bias)
-                layer_metrics[f'{method}_layer_{l+1}_cov_forbenius_norm'] = cov_frob
+                '''
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_mse'] = mse.mean()
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_var_l_inf'] = var.abs().max()
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_var_l2'] = torch.linalg.norm(var)
+                layer_metrics[f'{layer.fwd_method}_layer_{l + 1}_cov_trace'] = cov_trace.mean().cpu()
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_bias_l_inf'] = bias.abs().max()
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_bias_l2'] = torch.linalg.norm(bias)
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_cov_forbenius_norm'] = cov_frob
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_cos_sim'] = cosine_sim
+                layer_metrics[f'{method}_layer_{l + 1}_cos_sim'] = cosine_sim
+                layer_metrics[f'{method}_layer_{l + 1}_cos_sim_shifted'] = cosine_sim_shifted
+                layer_metrics[f'{method}_layer_{l + 1}_cos_sim_scaled'] = cosine_sim_scaled
+                '''
+                layer_metrics[f'W^T_layer_{l + 1}_mse'] = mse.mean()
+                layer_metrics[f'W^T_layer_{l + 1}_var_l_inf'] = var.abs().max()
+                layer_metrics[f'W^T_layer_{l + 1}_var_l2'] = torch.linalg.norm(var)
+                layer_metrics[f'W^T_layer_{l + 1}_cov_trace'] = cov_trace.mean().cpu()
+                layer_metrics[f'W^T_layer_{l + 1}_bias_l_inf'] = bias.abs().max()
+                layer_metrics[f'W^T_layer_{l + 1}_bias_l2'] = torch.linalg.norm(bias)
+                layer_metrics[f'W^T_layer_{l + 1}_cov_forbenius_norm'] = cov_frob
+                layer_metrics[f'W^T_layer_{l + 1}_cos_sim'] = cosine_sim
+                layer_metrics[f'W^T_layer_{l + 1}_cos_sim'] = cosine_sim
+                layer_metrics[f'W^T_layer_{l + 1}_cos_sim_shifted'] = cosine_sim_shifted
+                layer_metrics[f'W^T_layer_{l + 1}_cos_sim_scaled'] = cosine_sim_scaled
                 #print(mse.mean(), var.mean(), (bias).mean(), var.min())
     return layer_metrics
 
@@ -247,6 +303,6 @@ if train:
     losses = {}
     accuracies = {}
     n_epochs = 300
-    method = 'W^T'
+    method = 'CW^T'
     #train_losses, train_accuracies = act_perturb(['W^T'], n_epochs=n_epochs)
-    train_losses, train_accuracies = act_perturb(['W^T'], n_epochs=n_epochs)
+    train_losses, train_accuracies = act_perturb([method], n_epochs=n_epochs)

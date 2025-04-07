@@ -16,13 +16,13 @@ class jvp_MLP(nn.Module):
         self.net.append(jvp_loss())
         self.linear_layers = [layer for layer in self.net if isinstance(layer, jvp_linear)]
 
-        self.output_gradients = {}
+        self.output_gradients = []
         self._register_hooks()
 
     # log backprop gradients for testing
     def _register_hooks(self):
         def save_gradient_hook(module, grad_input, grad_output):
-            self.output_gradients[module] = grad_output[0]  # Store the gradient of the output
+            self.output_gradients.insert(0, grad_output[0])  # Store the gradient of the output
         # Register the hook on each linear layer
         for layer in self.net:
             if isinstance(layer, jvp_linear):
@@ -52,7 +52,7 @@ class jvp_MLP(nn.Module):
                 layer.weight_guess = torch.randn_like(layer.weight)
                 layer.bias_guess = torch.randn_like(layer.bias)
                 layer.fwd_method = 'weight_perturb'
-            elif self.method == 'act_perturb':
+            elif self.method == 'act_perturb' or self.method == 'act_perturb-relu':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0])) # B x out
                 layer.fwd_method = 'act_perturb'
             elif self.method == 'W^T':
@@ -85,9 +85,9 @@ class jvp_MLP(nn.Module):
     def set_grad(self, jvp): # set weight & bias grads for each linear layer
         for l, layer in enumerate(self.linear_layers):
             if self.method == 'weight_perturb':
-                layer.weight.grad = jvp.mean() * layer.weight_guess
-                layer.bias.grad = jvp.mean() * layer.bias_guess
-            elif self.method == 'act_perturb' or self.method == 'W^T' or self.method == 'layer_downstream':
+                layer.weight.grad = jvp.sum() * layer.weight_guess
+                layer.bias.grad = jvp.sum() * layer.bias_guess
+            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'layer_downstream']:
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
@@ -160,11 +160,21 @@ class jvp_linear(nn.Module):
             return out, jvp_out
         elif self.fwd_method == 'W^T':
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0])
-            self.s_guess = (s_next_guess @ self.W_next) * (
-                    (F.linear(x_in, self.weight, self.bias)) > 0) # relu mask
+            self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
+            self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
             #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
             #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
-            self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
+            out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
+            jvp_out = jvp + self.s_guess
+        elif self.fwd_method == 'act_perturb-relu':
+            x_next_guess = torch.randn(x_in.shape[0], self.weight.shape[0])
+            self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
+            self.s_guess = x_next_guess * self.mask # relu mask
+            #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
+            #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
+            self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
             #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
@@ -200,3 +210,5 @@ class jvp_relu(nn.Module):
     def jvp_forward(self, x_in, jvp_in):
         out, jvp_out = fc.jvp(self.forward, (x_in,), (jvp_in,))
         return out, jvp_out
+
+

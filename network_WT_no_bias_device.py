@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.func as fc
 import math
-
+import numpy as np
+import matplotlib.pyplot as plt
+import wandb
 device = 'mps'
 class jvp_MLP(nn.Module):
     def __init__(self, in_size, out_size, hidden_size=[128, 128, 128], method='weight_perturb'):
@@ -17,7 +19,8 @@ class jvp_MLP(nn.Module):
         self.net.append(jvp_linear(hidden_size[-1], out_size))
         self.net.append(jvp_loss())
         self.linear_layers = [layer for layer in self.net if isinstance(layer, jvp_linear)]
-
+        for l, layer in enumerate(self.linear_layers):
+            layer.l = l
         self.output_gradients = []
         self._register_hooks()
 
@@ -57,11 +60,13 @@ class jvp_MLP(nn.Module):
             elif self.method == 'act_perturb' or self.method == 'act_perturb-relu':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]), device=device) # B x out
                 layer.fwd_method = 'act_perturb'
-            elif self.method in ['W^T', 'CW^T']:
+            elif self.method in ['W^T', 'CW^T', 'CW^T2']:
                 if l < len(self.linear_layers) - 1:
                     layer.fwd_method = 'W^T'
                     if self.method == 'CW^T':
                         layer.fwd_method = 'CW^T'
+                    if self.method == 'CW^T2':
+                        layer.fwd_method = 'CW^T2'
                     # set W_next for all layers except last
                     layer.W_next = self.linear_layers[l + 1].weight.clone()
                 if l == len(self.linear_layers) - 1:
@@ -89,7 +94,7 @@ class jvp_MLP(nn.Module):
         for l, layer in enumerate(self.linear_layers):
             if self.method == 'weight_perturb':
                 layer.weight.grad = jvp.sum() * layer.weight_guess
-            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'layer_downstream']:
+            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2', 'layer_downstream']:
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
@@ -161,7 +166,7 @@ class jvp_linear(nn.Module):
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
             return out, jvp_out
-        elif self.fwd_method in ['W^T', 'CW^T']:
+        elif self.fwd_method in ['W^T', 'CW^T', 'CW^T2']:
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0], device=device)
             self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
             if self.fwd_method == 'W^T':
@@ -170,15 +175,64 @@ class jvp_linear(nn.Module):
                 #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
                 self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
             elif self.fwd_method == 'CW^T':
+                self.sigma = 1e-5
                 cov_WT = (self.W_next.T @ self.W_next)  # out, out
                 mask = torch.diag_embed(self.mask).to(torch.float32)
-                cov_y = (mask @ cov_WT @ mask) + 1e-5*self.eye
-                L, Q = torch.linalg.eigh(cov_y)
-                self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-1))), Q.permute((0, 2, 1))) # (B, out, out)
-                #self.s_guess1 = torch.bmm(self.C_pow, ((s_next_guess @ self.W_next) * self.mask).unsqueeze(-1)).squeeze() # relu mask
-                #assert self.C[0] @ cov_y[0] == self.eye
-                self.s_guess = torch.bmm(((s_next_guess @ self.W_next) * self.mask).unsqueeze(1), self.C).squeeze()
-                #print(self.s_guess2 - self.s_guess1)
+                cov_y = (mask @ cov_WT @ mask) + self.sigma*self.eye
+                try: # diagonalisation does not always work
+                    L, Q = torch.linalg.eigh(cov_y)
+                    self.b_eye = self.eye.unsqueeze(0).repeat(x_in.shape[0], 1, 1)
+                    self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-0.5))), Q.permute((0, 2, 1)))  # (B, out, out)
+                    self.C_inv = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-1.0))), Q.permute((0, 2, 1)))
+                    print(self.C_inv[0])
+                    # self.s_guess1 = torch.bmm(self.C_pow, ((s_next_guess @ self.W_next) * self.mask).unsqueeze(-1)).squeeze() # relu mask
+                    # assert self.C[0] @ cov_y[0] == self.eye
+                    self.s_guess = torch.bmm(((s_next_guess @ self.W_next) * self.mask).unsqueeze(1), self.C).squeeze()
+                except: # revert to W^T
+                    print("diagonalisation failed")
+                    self.s_guess = (s_next_guess @ self.W_next) * self.mask
+                '''
+                # Sort values in descending order
+                sorted_L = np.sort(L.mean(dim=0).clone().cpu().numpy())[::-1]
+                rank = torch.linalg.matrix_rank(cov_y).to(torch.float32).mean()
+                # Create bar chart
+                plt.figure(figsize=(10, 5))
+                plt.bar(range(self.weight.shape[0]), sorted_L)
+                plt.xlabel(f'Sorted eigenvalues, W^TW mean rank = {rank}')
+                plt.ylabel("Eigenvalue")
+                plt.title(f"Epoch 0 Layer {self.l+1} Eigenvalues for sigma = {self.sigma}")
+                plt.savefig(f'eigenvalue_plots/epoch_0_layer_{self.l+1}_eigenvalues_sigma_{self.sigma}.png')
+                plt.close()
+                '''
+                #print(((torch.bmm(self.C, torch.bmm(cov_y, self.C)) - self.b_eye)**2).sum())
+            elif self.fwd_method == 'CW^T2':
+                self.sigma = 1e-5
+                cov_WT = (self.W_next.T @ self.W_next)  # out, out
+                mask = torch.diag_embed(self.mask).to(torch.float32)
+                cov_y = (mask @ cov_WT @ mask) + self.sigma*self.eye
+                # compute W' using svd
+                W = self.W_next @ mask
+                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+                #print(torch.bmm(torch.bmm(U, torch.diag_embed(S ** 2 + self.sigma).sqrt()), Vh)[0] -
+                #      (U[0] * (S[0] ** 2 + self.sigma).sqrt() @ Vh[0]))
+                self.W_ = torch.bmm(torch.bmm(U, torch.diag_embed(S ** 2 + self.sigma).sqrt()), Vh)
+                #print(torch.bmm(W.permute((0, 2, 1)), W) + self.sigma * self.eye - torch.bmm(self.W_.permute((0, 2, 1)), self.W_))
+                # done
+                try: # diagonalisation does not always work
+                    L, Q = torch.linalg.eigh(cov_y)
+                    self.b_eye = self.eye.unsqueeze(0).repeat(x_in.shape[0], 1, 1)
+                    self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-0.5))), Q.permute((0, 2, 1)))  # (B, out, out)
+                    #self.C_inv = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-1.0))), Q.permute((0, 2, 1)))
+                    # self.s_guess1 = torch.bmm(self.C_pow, ((s_next_guess @ self.W_next) * self.mask).unsqueeze(-1)).squeeze() # relu mask
+                    # assert self.C[0] @ cov_y[0] == self.eye
+                    #print(((s_next_guess[0] @ self.W_next) * self.mask[0] - (s_next_guess[0] @ W[0])).abs().max())
+                    #print((s_next_guess[0] @ W[0]) - torch.bmm(s_next_guess.unsqueeze(1), W)[0])
+                    #print((((s_next_guess @ self.W_next) * self.mask) - (torch.bmm(s_next_guess.unsqueeze(1), W)).squeeze()).abs().max())
+                    self.s_guess = torch.bmm(torch.bmm(s_next_guess.unsqueeze(1), self.W_), self.C).squeeze()
+                    #self.s_guess = torch.bmm(((s_next_guess @ self.W_next) * self.mask).unsqueeze(1), self.C).squeeze()
+                except: # revert to W^T
+                    print("diagonalisation failed")
+                    self.s_guess = (s_next_guess @ self.W_next) * self.mask
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
         elif self.fwd_method == 'act_perturb-relu':

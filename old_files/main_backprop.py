@@ -14,18 +14,29 @@ import math
 import matplotlib.pyplot as plt
 import json
 from pyhessian import hessian
-
-print('importing network from network.py')
+from mnist1d.data import make_dataset, get_dataset_args
 device = 'cpu'
+# mnist 1d
+use_mnist = True
+if use_mnist:
+    defaults = get_dataset_args()
+    data = make_dataset(defaults)
+    x, y, x_test, y_test = data['x'], data['y'], data['x_test'], data['y_test']
+    tensor_x = torch.tensor(x, dtype=torch.float32)
+    tensor_y = torch.tensor(y, dtype=torch.long)
+    tensor_test_x = torch.tensor(x_test, dtype=torch.float32)
+    tensor_test_y = torch.tensor(y_test, dtype=torch.long)
+    train_dataset = torch.utils.data.TensorDataset(tensor_x, tensor_y)
+    test_dataset = torch.utils.data.TensorDataset(tensor_test_x, tensor_test_y)
+else:
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to range [-1, 1]
+    ])
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to range [-1, 1]
-])
-
-# Download the CIFAR-10 training and test datasets
-train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    # Download the CIFAR-10 training and test datasets
+    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
 # Create data loaders
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=512, shuffle=True)
@@ -54,7 +65,7 @@ def act_perturb(method, n_epochs):
         config={
             "learning_rate": 1e-4,
             "architecture": "MLP_W^T",
-            "dataset": "CIFAR10",
+            "dataset": "CIFAR10" if not use_mnist else "mnist_1d",
             "epochs": 10,
         }
     )
@@ -67,13 +78,16 @@ def act_perturb(method, n_epochs):
     optimizer = torch.optim.AdamW(params_to_optimize, lr=1e-4)
     test_losses = []
     test_accuracies = []
+    layer_metrics = {}
     with torch.no_grad():
         for epoch in range(n_epochs):
             train_losses = []
             for b, batch in enumerate(train_dataloader):
                 x, y = batch
-                N, C, H, W = x.shape
-                x = torch.reshape(x, (N, C*H*W)).to(device)
+                if not use_mnist:
+                    N, C, H, W = x.shape
+                    x = torch.reshape(x, (N, C*H*W)).to(device)
+                '''
                 ###
                 optimizer.zero_grad()
                 loss, jvp = model.jvp_forward(x, y.to(device))
@@ -85,7 +99,7 @@ def act_perturb(method, n_epochs):
                 #for name, param in model.named_parameters():
                 #    print(name, fwd_grads[name])
                 # Optimizer step
-                optimizer.step()
+                #optimizer.step()
                 layer_metrics = compute_bias(model, x, y, jvp)
                 top_eigenvalues = compute_hessian(model, x, y)
                 #layer_metrics['top_eigenvalues'] = top_eigenvalues
@@ -93,12 +107,20 @@ def act_perturb(method, n_epochs):
                 layer_metrics.update({"train_loss": loss.sum().item()})
                 wandb.log(layer_metrics)
                 # backprop
+                '''
                 with torch.enable_grad():
                     out = model(x)
                     loss = F.cross_entropy(out, y)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                top_eigenvalues = compute_hessian(model, x, y)
+                layer_metrics['top_eigenvalues'] = top_eigenvalues
+                layer_metrics.update(top_eigenvalues)
+                layer_metrics.update({"train_loss": loss.item()})
+                wandb.log(layer_metrics)
+
+
             test = False
             if test:
                 test_loss, accuracy = test_act_perturb(model, train_dataloader)
@@ -156,7 +178,7 @@ def compute_hessian(model, x, y):
     with torch.enable_grad():
         hessian_comp = hessian(model, criterion=nn.CrossEntropyLoss(), data=(x, y), cuda=False)
         top_eigenvalues, top_eigenvectors = hessian_comp.eigenvalues(top_n=15)
-        print(top_eigenvalues)
+        #print(top_eigenvalues)
         #print(top_eigenvectors[0])
         for v, value in enumerate(sorted(top_eigenvalues)):
             top_hessian_eigenvalues[f'eigenvalue_{v}'] = value

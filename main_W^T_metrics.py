@@ -12,6 +12,7 @@ from network_WT_no_bias_device import jvp_MLP, device
 from functools import partial
 from torch.optim.lr_scheduler import LambdaLR
 from metrics import compute_layer_metrics_test
+import matplotlib.pyplot as plt
 import wandb
 import numpy as np
 import math
@@ -20,6 +21,17 @@ import json
 from pyhessian import hessian
 from mnist1d.data import make_dataset, get_dataset_args
 import torch.mps
+import random
+manualSeed = 100
+random.seed(manualSeed)
+np.random.seed(manualSeed)
+torch.manual_seed(manualSeed)
+torch.cuda.manual_seed(manualSeed)
+torch.cuda.manual_seed_all(manualSeed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ['PYTHONHASHSEED'] = str(manualSeed)
+
 # mnist 1d
 use_mnist = True
 if use_mnist:
@@ -81,10 +93,11 @@ def act_perturb(methods, n_epochs):
     size = 128
     model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
                 out_size=10, hidden_size=[size, size, size])
+    #model.load_state_dict(torch.load(f'model_checkpoints/W^T_128_300*'))
     model_backprop = copy.deepcopy(model)
     model_backprop.to(device)
     model.to(device)
-    model.method = 'CW^T'
+    model.method = methods[0]
     params_to_optimize = [
         param for name, param in model.named_parameters()
     ]
@@ -183,8 +196,8 @@ def compute_gradient(model, optimizer, x, y):
     #act_grads = [layer.s_guess for layer in model.linear_layers][:-1]
     return act_grads, parameters_grads
 
-def compute_bias(dL, layer, method):
-    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T']
+def compute_bias(dL, layer, method, layer_num):
+    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2']
     with torch.no_grad():
         if method == 'weight_perturb' or method == 'act_perturb':
             # unbiased
@@ -197,24 +210,41 @@ def compute_bias(dL, layer, method):
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
             cov_y = mask @ cov_WT @ mask  # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]  #torch.linalg.det(cov_y.cpu()).mean()
         elif method == 'CW^T':
             # for y=C@mask*(W^Te), cov(y) = C @ mask @ W^TW @ mask @ C^Twhere mask is a diagonal matrix
             cov_WT = (layer.W_next.T.detach() @ layer.W_next.detach())  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
-            cov_y = torch.bmm(layer.C, torch.bmm((mask @ cov_WT @ mask + 1e-5*layer.eye), layer.C))  # (B, out, out)
-            #cov_y = torch.bmm(layer.C, (mask @ cov_WT @ mask + 1e-5*layer.eye))
+            cov_y = torch.bmm(layer.C, torch.bmm((mask @ cov_WT @ mask), layer.C))  # (B, out, out)
+            # true bias is ((-layer.sigma*layer.C_inv) ** 2).mean().sqrt().cpu())
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            cov_y1 = mask @ cov_WT @ mask + 1e-5*layer.eye
+            #cov_y1 = mask @ cov_WT @ mask + layer.sigma*layer.eye
+            #cov_y = mask @ cov_WT @ mask
+            #print(((cov_y - layer.b_eye)**2).mean().sqrt().cpu(), (torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]).mean())
+        elif method == 'CW^T2':
+            cov_WT = (layer.W_next.T.detach() @ layer.W_next.detach())  # out, out
+            mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
+            cov = mask @ cov_WT @ mask + layer.sigma * layer.eye
+            #cov_y = torch.bmm(layer.C, torch.bmm(torch.bmm(layer.W_.permute((0, 2, 1)), layer.W_), layer.C))  # (B, out, out)
+            cov_y = torch.bmm(layer.C, torch.bmm(cov, layer.C))
+            # true bias is ((-layer.sigma*layer.C_inv) ** 2).mean().sqrt().cpu())
+            # cov_y = torch.bmm(layer.C, (mask @ cov_WT @ mask + 1e-5*layer.eye))
+            bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
+            # debugging
 
-            return bias.cpu(), ((torch.bmm(cov_y, cov_y1) - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]
+           # print(torch.bmm(layer.W_.permute((0, 2, 1)), layer.W_) - cov)
         elif method == 'act_perturb-relu':
             #cov_WT = layer.W_next.T @ layer.W_next  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
             cov_y = mask # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            return bias.cpu(), ((cov_y - layer.eye)**2).mean().sqrt().cpu(), torch.vmap(torch.trace)(cov_y) #torch.linalg.det(cov_y.cpu()).mean()
-
+        # plot covariance matrix
+        #plt.matshow((cov_y[0]-layer.eye).clone().cpu().numpy())
+        #plt.savefig(f'plots/cov_{method}_layer_{layer_num}')
+        #plt.close()
+        # plt.show()
+        print(((cov_y - layer.eye) ** 2).mean().sqrt().cpu())
+        return bias.cpu(), ((cov_y - layer.eye) ** 2).mean().sqrt().cpu(), (
+                    torch.vmap(torch.trace)(cov_y) / cov_y.shape[-1]).mean()
 def compute_cosine_sim(dL, dL_guess):
     cos_sim_fn = nn.CosineSimilarity(dim=1)
     cos_sim = cos_sim_fn(dL, dL_guess).mean().cpu()
@@ -249,7 +279,7 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                     dL = act_grads[l]  # (B, out)
                     dL_guess = (jvp.unsqueeze(-1)*layer.s_guess).detach()
                     cosine_sim, cosine_sim_shifted, cosine_sim_scaled = compute_cosine_sim(dL, dL_guess)
-                bias, cov_frob, cov_trace = compute_bias(dL, layer, layer.fwd_method)
+                bias, cov_frob, cov_trace = compute_bias(dL, layer, layer.fwd_method, l)
                 #print((torch.tensor(np.cov(dL_guess, rowvar=False))-cov_WT).mean())
                 #print(dL.mean(), dL_guess.mean())
                 mse = ((dL_guess - dL)**2).mean(dim=0).cpu()
@@ -260,14 +290,14 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_mse'] = mse.mean()
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_var_l_inf'] = var.abs().max()
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_var_l2'] = torch.linalg.norm(var)
-                layer_metrics[f'{layer.fwd_method}_layer_{l + 1}_cov_trace'] = cov_trace.mean().cpu()
+                layer_metrics[f'{layer.fwd_method}_layer_{l+1}_cov_trace'] = cov_trace.mean().cpu()
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_bias_l_inf'] = bias.abs().max()
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_bias_l2'] = torch.linalg.norm(bias)
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_cov_forbenius_norm'] = cov_frob
                 layer_metrics[f'{layer.fwd_method}_layer_{l+1}_cos_sim'] = cosine_sim
-                layer_metrics[f'{method}_layer_{l + 1}_cos_sim'] = cosine_sim
-                layer_metrics[f'{method}_layer_{l + 1}_cos_sim_shifted'] = cosine_sim_shifted
-                layer_metrics[f'{method}_layer_{l + 1}_cos_sim_scaled'] = cosine_sim_scaled
+                layer_metrics[f'{method}_layer_{l+1}_cos_sim'] = cosine_sim
+                layer_metrics[f'{method}_layer_{l+1}_cos_sim_shifted'] = cosine_sim_shifted
+                layer_metrics[f'{method}_layer_{l+1}_cos_sim_scaled'] = cosine_sim_scaled
                 '''
                 layer_metrics[f'W^T_layer_{l + 1}_mse'] = mse.mean()
                 layer_metrics[f'W^T_layer_{l + 1}_var_l_inf'] = var.abs().max()

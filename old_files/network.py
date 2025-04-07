@@ -16,26 +16,24 @@ class jvp_MLP(nn.Module):
         self.net.append(jvp_loss())
         self.linear_layers = [layer for layer in self.net if isinstance(layer, jvp_linear)]
 
-        self.output_gradients = []
+        self.output_gradients = {}
         self._register_hooks()
 
     # log backprop gradients for testing
     def _register_hooks(self):
         def save_gradient_hook(module, grad_input, grad_output):
-            self.output_gradients.insert(0, grad_output[0]) # Store the gradient of the output
+            self.output_gradients[module] = grad_output[0]  # Store the gradient of the output
         # Register the hook on each linear layer
         for layer in self.net:
             if isinstance(layer, jvp_linear):
                 layer.register_backward_hook(save_gradient_hook)
 
     def forward(self, x, return_loss=False): # will not go through loss fn
-        self.output_gradients = []
         for layer in self.net[:-1]:
             x = layer(x)
         return x
 
     def jvp_forward(self, x, y):
-        self.output_gradients = []
         self.prepare_layers(x)
         jvp_in = torch.zeros_like(x)
         for layer in self.net[:-1]:
@@ -50,7 +48,11 @@ class jvp_MLP(nn.Module):
         # set other required attributes e.g layer.W_next for W^T
         # set layer fwd behaviour (track weight jvps or activation jvps)
         for l, layer in enumerate(self.linear_layers):
-            if self.method == 'act_perturb':
+            if self.method == 'weight_perturb':
+                layer.weight_guess = torch.randn_like(layer.weight)
+                layer.bias_guess = torch.randn_like(layer.bias)
+                layer.fwd_method = 'weight_perturb'
+            elif self.method == 'act_perturb':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0])) # B x out
                 layer.fwd_method = 'act_perturb'
             elif self.method == 'W^T':
@@ -61,10 +63,31 @@ class jvp_MLP(nn.Module):
                 if l == len(self.linear_layers)-1:
                     layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]))  # B x out
                     layer.fwd_method = 'act_perturb'
+            elif self.method == 'act_mixing':
+                if l == 0 : # first layer has all zero jvp
+                    layer.fwd_method = 'act_perturb'
+                    layer.s_guess = torch.zeros(x.shape[0], layer.weight.shape[0])
+                elif l == len(self.linear_layers)-1: # last layer has randn guess
+                    layer.fwd_method = 'act_mixing'
+                    layer.s_guess = torch.randn(x.shape[0], layer.weight.shape[0])
+                else:
+                    layer.fwd_method = 'act_mixing'
+                    layer.s_guess = 0
+            elif self.method == 'layer_downstream':
+                layer.fwd_method = 'layer_downstream'
+                if l == len(self.linear_layers) - 1:
+                    layer.s_guess = torch.randn(x.shape[0], layer.weight.shape[0])
+                    layer.fwd_method = 'act_perturb'
+                else:
+                    layer.weight_next = self.linear_layers[l+1].weight.clone()
+                    layer.bias_next = self.linear_layers[l+1].bias.clone()
 
     def set_grad(self, jvp): # set weight & bias grads for each linear layer
         for l, layer in enumerate(self.linear_layers):
-            if self.method == 'act_perturb' or self.method == 'W^T' or self.method == 'layer_downstream':
+            if self.method == 'weight_perturb':
+                layer.weight.grad = jvp.sum() * layer.weight_guess
+                layer.bias.grad = jvp.sum() * layer.bias_guess
+            elif self.method == 'act_perturb' or self.method == 'W^T' or self.method == 'layer_downstream':
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
@@ -73,6 +96,19 @@ class jvp_MLP(nn.Module):
                 # with torch.enable_grad():
                 #    s = F.linear(self.x_in, self.weight, self.bias)
                 #    s.backward(gradient=jvp.unsqueeze(-1)*self.s_guess)
+
+            elif self.method == 'act_mixing':
+                if l == len(self.linear_layers)-1: # last layer same as act perturb
+                    scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
+                    layer.weight.grad = (
+                        (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
+                    ).sum(dim=0)
+                    layer.bias.grad = scaled_s_guess.sum(dim=0)
+                else: # backprop from guessed activations at start of next layer
+                    backprop_grad = jvp.unsqueeze(-1)*self.linear_layers[l+1].x_guess
+                    with torch.enable_grad():
+                        x_next = F.relu(F.linear(layer.x_in, layer.weight, layer.bias))
+                        x_next.backward(gradient=backprop_grad)
 
 
 class jvp_linear(nn.Module):
@@ -102,16 +138,36 @@ class jvp_linear(nn.Module):
         elif self.fwd_method == 'act_perturb':
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp+self.s_guess
-        elif self.fwd_method == 'W^T':
-            s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0])
-            self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
-            self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
-            #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
-            #self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+        elif self.fwd_method == 'act_mixing':
+            alphas = torch.randn((x_in.shape[0], x_in.shape[0]))
+            mixture = alphas @ x_in # B, in
+            mixture *= (x_in>0) # relu mask
+            # normalise to match the norm of a randn sampled guess? expected norm = sqrt(n)
+            self.x_guess = mixture * (torch.tensor(mixture.shape[1], dtype=torch.float32).sqrt()) / (
+                (mixture**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in + self.x_guess,))
+            jvp_out = jvp + self.s_guess
+        elif self.fwd_method == 'layer_downstream':
+            # backprop then compute jvp for activations
+            s_i = nn.Parameter(self(x_in), requires_grad=True)
+            with torch.enable_grad():
+                s_next = F.relu(F.linear(F.relu(s_i), self.weight_next, self.bias_next))
+                s_next.backward(gradient=torch.randn_like(s_next))
+                self.s_guess = s_i.grad * (torch.tensor(s_i.grad.shape[1], dtype=torch.float32).sqrt()) / ((s_i.grad**2).sum(dim=1).sqrt()).unsqueeze(-1)
+
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
-            # used for bias computation
-
+            return out, jvp_out
+        elif self.fwd_method == 'W^T':
+            s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0])
+            self.s_guess = (s_next_guess @ self.W_next) * (
+                    (F.linear(x_in, self.weight, self.bias)) > 0) # relu mask
+            #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
+            #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
+            self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
+            #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
+            out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
+            jvp_out = jvp + self.s_guess
         return out, jvp_out
 
 class jvp_loss(nn.Module):

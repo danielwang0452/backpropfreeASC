@@ -197,7 +197,7 @@ def compute_gradient(model, optimizer, x, y):
     return act_grads, parameters_grads
 
 def compute_bias(dL, layer, method, layer_num):
-    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2']
+    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2', 'clip-CW^T2']
     with torch.no_grad():
         if method == 'weight_perturb' or method == 'act_perturb':
             # unbiased
@@ -220,7 +220,7 @@ def compute_bias(dL, layer, method, layer_num):
             #cov_y1 = mask @ cov_WT @ mask + layer.sigma*layer.eye
             #cov_y = mask @ cov_WT @ mask
             #print(((cov_y - layer.b_eye)**2).mean().sqrt().cpu(), (torch.vmap(torch.trace)(cov_y)/cov_y.shape[-1]).mean())
-        elif method == 'CW^T2':
+        elif method in ['CW^T2', 'clip-CW^T2']:
             cov_WT = (layer.W_next.T.detach() @ layer.W_next.detach())  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
             cov = mask @ cov_WT @ mask + layer.sigma * layer.eye
@@ -242,7 +242,7 @@ def compute_bias(dL, layer, method, layer_num):
         #plt.savefig(f'plots/cov_{method}_layer_{layer_num}')
         #plt.close()
         # plt.show()
-        print(((cov_y - layer.eye) ** 2).mean().sqrt().cpu())
+        #print(((cov_y - layer.eye) ** 2).mean().sqrt().cpu())
         return bias.cpu(), ((cov_y - layer.eye) ** 2).mean().sqrt().cpu(), (
                     torch.vmap(torch.trace)(cov_y) / cov_y.shape[-1]).mean()
 def compute_cosine_sim(dL, dL_guess):
@@ -333,6 +333,6 @@ if train:
     losses = {}
     accuracies = {}
     n_epochs = 300
-    method = 'CW^T'
+    method = 'clip-CW^T2'
     #train_losses, train_accuracies = act_perturb(['W^T'], n_epochs=n_epochs)
     train_losses, train_accuracies = act_perturb([method], n_epochs=n_epochs)

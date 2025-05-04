@@ -24,6 +24,10 @@ class jvp_MLP(nn.Module):
         self.output_gradients = []
         self._register_hooks()
 
+    def set_n(self, n): # set the value of n to divide epsilon by for double descent
+        for layer in self.linear_layers:
+            layer.n = n
+        return
     # log backprop gradients for testing
     def _register_hooks(self):
         def save_gradient_hook(module, grad_input, grad_output):
@@ -60,11 +64,9 @@ class jvp_MLP(nn.Module):
             elif self.method == 'act_perturb' or self.method == 'act_perturb-relu':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]), device=device) # B x out
                 layer.fwd_method = 'act_perturb'
-            elif self.method in ['W^T', 'CW^T', 'CW^T2', 'clip-CW^T2']:
+            elif self.method in ['W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T']:
                 if l < len(self.linear_layers) - 1:
-                    layer.fwd_method = 'W^T'
-                    if self.method in ['CW^T', 'CW^T2', 'clip-CW^T2']:
-                        layer.fwd_method = self.method
+                    layer.fwd_method = self.method
                     # set W_next for all layers except last
                     layer.W_next = self.linear_layers[l + 1].weight.clone()
                 if l == len(self.linear_layers) - 1:
@@ -90,9 +92,10 @@ class jvp_MLP(nn.Module):
 
     def set_grad(self, jvp): # set weight & bias grads for each linear layer
         for l, layer in enumerate(self.linear_layers):
-            if self.method == 'weight_perturb':
+            if layer.fwd_method == 'weight_perturb':
                 layer.weight.grad = jvp.sum() * layer.weight_guess
-            elif self.method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2', 'clip-CWT^2, layer_downstream']:
+            elif layer.fwd_method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2',
+                                      'clip-CW^T2, layer_downstream', 'orthogonal_W^T']:
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
@@ -102,7 +105,7 @@ class jvp_MLP(nn.Module):
                 #    s = F.linear(self.x_in, self.weight, self.bias)
                 #    s.backward(gradient=jvp.unsqueeze(-1)*self.s_guess)
 
-            elif self.method == 'act_mixing':
+            elif layer.fwd_method == 'act_mixing':
                 if l == len(self.linear_layers)-1: # last layer same as act perturb
                     scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                     layer.weight.grad = (
@@ -124,6 +127,7 @@ class jvp_linear(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
         self.eye = torch.eye(out_size).to(device)
+        self.n = 1.0
         #bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
         #nn.init.uniform_(self.bias, -bound, bound)
 
@@ -164,8 +168,9 @@ class jvp_linear(nn.Module):
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
             return out, jvp_out
-        elif self.fwd_method in ['W^T', 'CW^T','CW^T2', 'clip-CW^T2']:
+        elif self.fwd_method in ['W^T', 'CW^T','CW^T2', 'clip-CW^T2', 'orthogonal_W^T']:
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0], device=device)
+            s_next_guess# /= torch.tensor(self.n).sqrt()
             self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
             if self.fwd_method == 'W^T':
                 self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
@@ -201,6 +206,7 @@ class jvp_linear(nn.Module):
                 plt.title(f"Epoch 0 Layer {self.l+1} Eigenvalues for sigma = {self.sigma}")
                 plt.savefig(f'eigenvalue_plots/epoch_0_layer_{self.l+1}_eigenvalues_sigma_{self.sigma}.png')
                 plt.close()
+                print('saved')
                 '''
                 #print(((torch.bmm(self.C, torch.bmm(cov_y, self.C)) - self.b_eye)**2).sum())
             elif self.fwd_method in ['CW^T2', 'clip-CW^T2']:
@@ -218,11 +224,11 @@ class jvp_linear(nn.Module):
                 # done
                 try: # diagonalisation does not always work
                     L, Q = torch.linalg.eigh(cov_y)
-                    if self.fwd_method == 'clip-CW^T2':
+                    if self.fwd_method == 'CW^T2':
                         L = torch.clamp(L, min=0.05)
                     self.b_eye = self.eye.unsqueeze(0).repeat(x_in.shape[0], 1, 1)
                     self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-0.5))), Q.permute((0, 2, 1)))  # (B, out, out)
-                    #self.C_inv = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-1.0))), Q.permute((0, 2, 1)))
+                    #self.C_inv = torch.bmm(torch.bmm(Q, torch.diag_embed(L.p  ow(-1.0))), Q.permute((0, 2, 1)))
                     # self.s_guess1 = torch.bmm(self.C_pow, ((s_next_guess @ self.W_next) * self.mask).unsqueeze(-1)).squeeze() # relu mask
                     # assert self.C[0] @ cov_y[0] == self.eye
                     #print(((s_next_guess[0] @ self.W_next) * self.mask[0] - (s_next_guess[0] @ W[0])).abs().max())
@@ -235,6 +241,32 @@ class jvp_linear(nn.Module):
                     self.s_guess = (s_next_guess @ self.W_next) * self.mask
                     #self.s_guess = self.s_guess * (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
                 #print(torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt(), ((self.s_guess**2).sum(dim=1).sqrt()))
+            elif self.fwd_method == 'orthogonal_W^T':
+                mask = torch.diag_embed(self.mask).to(torch.float32)
+                # compute W' using svd
+                W = self.W_next @ mask
+                self.rank = int(torch.linalg.matrix_rank(W).to(torch.float32).mean())
+                print(self.rank)
+                #print(self.l, self.rank)
+                #rank=int(self.n)
+                rank = min(int(torch.linalg.matrix_rank(W).to(torch.float32).mean()), 25)
+                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+                self.U, self.S, self.Vh = U[:, :, :rank], S[:, :rank], Vh[:, :rank, :]
+                # set k such that sum k sigma_k^2 = 0.99 sum r sigma_r^2
+                '''
+                threshold = 0.99 * (self.S.mean(dim=0)**2).sum()
+                k = 0
+                while (self.S.mean(dim=0)[:k]**2).sum() < threshold:
+                    k += 1
+                rank = k
+                '''
+                # only keep the orthonormal columns corresponding to nonzero singular values
+                self.W_ = torch.bmm(self.U, self.Vh)
+                #self.W_ = U[:, :rank] @ Vh[:rank, :]
+                #W_ = self.W_[0]
+                #plt.matshow((W_.T @ W_).clone().cpu().numpy())
+                #plt.savefig(f'plots/WTW_layer_{self.l}_r_{int(rank)}')
+                self.s_guess = torch.bmm(s_next_guess.unsqueeze(1), self.W_).squeeze()
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
         elif self.fwd_method == 'act_perturb-relu':
@@ -280,5 +312,3 @@ class jvp_relu(nn.Module):
     def jvp_forward(self, x_in, jvp_in):
         out, jvp_out = fc.jvp(self.forward, (x_in,), (jvp_in,))
         return out, jvp_out
-
-

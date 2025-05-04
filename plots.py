@@ -93,7 +93,7 @@ def act_perturb(methods, n_epochs):
     size = 128
     model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
                 out_size=10, hidden_size=[size, size, size])
-    #model.load_state_dict(torch.load(f'model_checkpoints/W^T_128_300*'))
+    model.load_state_dict(torch.load(f'model_checkpoints/orthogonal_W^T_128_200'))
     model_backprop = copy.deepcopy(model)
     model_backprop.to(device)
     model.to(device)
@@ -148,6 +148,40 @@ def act_perturb(methods, n_epochs):
                 model.set_grad(jvp)
                 # Optimizer step
                 optimizer.step()
+                # double descent plot
+                mses1 = []
+                mses2 = []
+                mses3 = []
+                alphas = []
+                #ns = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0]
+                ns = torch.arange(1, 128)
+                #print(ns)
+                for n in ns:
+                    print(n)
+                    # set n in network layer
+                    model.set_n(n)
+                    # get mse
+                    layer_metrics = compute_layer_metrics(model, optimizer, x, y, methods)
+                    mses1.append(layer_metrics['W^T_layer_1_overlap'].cpu().numpy())
+                    mses2.append(layer_metrics['W^T_layer_2_overlap'].cpu().numpy())
+                    mses3.append(layer_metrics['W^T_layer_3_overlap'].cpu().numpy())
+                    alphas.append(n)
+                rank1 = layer_metrics['W^T_layer_1_rank']
+                rank2 = layer_metrics['W^T_layer_2_rank']
+                rank3 = layer_metrics['W^T_layer_3_rank']
+                plt.figure()
+                plt.plot(alphas, mses1, label=f'layer 1 rank={rank1}')
+                plt.plot(alphas, mses2, label=f'layer 2 rank={rank2}')
+                plt.plot(alphas, mses3, label=f'layer 3 rank={rank3}')
+                plt.xlabel('rank of orthogonal W')
+                plt.ylabel('overlap')
+                plt.title('overlap of dL in top x% rank space')
+                plt.legend()
+                plt.grid(True)
+
+                # Save the plot
+                plt.savefig('plots/orthogonal-W^T_randn_overlap.png')
+                #print(mses)
                 layer_metrics = compute_layer_metrics(model, optimizer, x, y, methods)
                 layer_metrics[f"train_loss"] = loss.mean().cpu().numpy()
                 #layer_metrics[f"{model.method}_test_accuracy"] = np.array(test_accuracy).mean()
@@ -156,12 +190,11 @@ def act_perturb(methods, n_epochs):
                 layer_metrics["backprop_train_accuracy"] = np.array(train_accuracy_b).mean()
                 layer_metrics["backprop_test_accuracy"] = np.array(test_accuracy_b).mean()
                 wandb.log(layer_metrics)
-            if (epoch+1) % 100 == 0:
-                torch.save(model.state_dict(), f'model_checkpoints/{model.method}_{size}_{epoch}')
+                break
+            break
             #model = None
             #model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
             #                out_size=10, hidden_size=[1024, 1024, 1024], method='W^T')
-
         wandb.finish()
         return test_losses, test_accuracies
 
@@ -197,8 +230,7 @@ def compute_gradient(model, optimizer, x, y):
     return act_grads, parameters_grads
 
 def compute_bias(dL, layer, method, layer_num):
-    assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu',
-                      'W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T']
+    #assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2', 'clip-CW^T2']
     with torch.no_grad():
         if method == 'weight_perturb' or method == 'act_perturb':
             # unbiased
@@ -231,10 +263,7 @@ def compute_bias(dL, layer, method, layer_num):
             # cov_y = torch.bmm(layer.C, (mask @ cov_WT @ mask + 1e-5*layer.eye))
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
             # debugging
-        elif method == 'orthogonal_W^T':
-            cov_y = torch.bmm(layer.W_.permute((0, 2,1 )), layer.W_)  # (B, out, out)
-            bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            # debugging
+
            # print(torch.bmm(layer.W_.permute((0, 2, 1)), layer.W_) - cov)
         elif method == 'act_perturb-relu':
             #cov_WT = layer.W_next.T @ layer.W_next  # out, out
@@ -247,9 +276,10 @@ def compute_bias(dL, layer, method, layer_num):
         #plt.close()
         # plt.show()
         #print(((cov_y - layer.eye) ** 2).mean().sqrt().cpu())
+        else:
+            print('method not found')
         return bias.cpu(), ((cov_y - layer.eye) ** 2).mean().sqrt().cpu(), (
                     torch.vmap(torch.trace)(cov_y) / cov_y.shape[-1]).mean()
-
 def compute_cosine_sim(dL, dL_guess):
     cos_sim_fn = nn.CosineSimilarity(dim=1)
     cos_sim = cos_sim_fn(dL, dL_guess).mean().cpu()
@@ -284,18 +314,20 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                     dL = act_grads[l]  # (B, out)
                     dL_guess = (jvp.unsqueeze(-1)*layer.s_guess).detach()
                     cosine_sim, cosine_sim_shifted, cosine_sim_scaled = compute_cosine_sim(dL, dL_guess)
-                bias, cov_frob, cov_trace = compute_bias(dL, layer, layer.fwd_method, l)
-                mse = ((dL_guess - dL)**2).mean(dim=0).cpu()
-                var = mse - bias**2
-                # look at projection of true dL onto W range space
+                #bias, cov_frob, cov_trace = compute_bias(dL, layer, layer.fwd_method, l)
+                #mse = ((dL_guess - dL)**2).mean(dim=0).cpu()
+                #var = mse - bias**2
+                #var2 = dL_guess.var(dim=0)
+                #print((var - var2).mean())
                 if layer.fwd_method == 'orthogonal_W^T':
-                    #dL = torch.randn_like(dL)
-                    P = torch.bmm(layer.Vh.permute((0, 2 , 1)), layer.Vh)
+                    dL = torch.randn_like(dL)
+                    P = torch.bmm(layer.Vh.permute((0, 2, 1)), layer.Vh)
                     dL_proj = torch.bmm(P, dL.unsqueeze(-1)).squeeze()
-                    overlap = ((dL_proj**2).sum(dim=1)/(dL**2).sum(dim=1)).mean()
+                    overlap = ((dL_proj ** 2).sum(dim=1) / (dL ** 2).sum(dim=1)).mean()
                     #print(overlap)
-                    layer_metrics[f'W^T_layer_{l + 1}_overlap'] = overlap
-
+                layer_metrics[f'W^T_layer_{l + 1}_rank'] = layer.rank
+                layer_metrics[f'W^T_layer_{l + 1}_overlap'] = overlap
+                '''
                 layer_metrics[f'W^T_layer_{l + 1}_mse'] = mse.mean()
                 layer_metrics[f'W^T_layer_{l + 1}_var_l_inf'] = var.abs().max()
                 layer_metrics[f'W^T_layer_{l + 1}_var_l2'] = torch.linalg.norm(var)
@@ -307,6 +339,7 @@ def compute_layer_metrics(model, optimizer, x, y, methods=['weight_perturb', 'ac
                 layer_metrics[f'W^T_layer_{l + 1}_cos_sim'] = cosine_sim
                 layer_metrics[f'W^T_layer_{l + 1}_cos_sim_shifted'] = cosine_sim_shifted
                 layer_metrics[f'W^T_layer_{l + 1}_cos_sim_scaled'] = cosine_sim_scaled
+                '''
                 #print(mse.mean(), var.mean(), (bias).mean(), var.min())
     return layer_metrics
 

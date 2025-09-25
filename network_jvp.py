@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +6,8 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import wandb
+import json
+from newton_schulz.Newton_Schulz import lanczos, get_kth_singular_val, zeropower_via_newtonschulz5
 device = 'mps'
 class jvp_MLP(nn.Module):
     def __init__(self, in_size, out_size, hidden_size=[128, 128, 128], method='weight_perturb'):
@@ -20,7 +21,7 @@ class jvp_MLP(nn.Module):
         self.net.append(jvp_loss())
         self.linear_layers = [layer for layer in self.net if isinstance(layer, jvp_linear)]
         for l, layer in enumerate(self.linear_layers):
-            layer.l = l
+            layer.l = l # keep count of layers
         self.output_gradients = []
         self._register_hooks()
 
@@ -64,7 +65,7 @@ class jvp_MLP(nn.Module):
             elif self.method == 'act_perturb' or self.method == 'act_perturb-relu':
                 layer.s_guess = torch.randn((x.shape[0], layer.weight.shape[0]), device=device) # B x out
                 layer.fwd_method = 'act_perturb'
-            elif self.method in ['W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T']:
+            elif self.method in ['W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T', 'orthogonal_W^T_NS']:
                 if l < len(self.linear_layers) - 1:
                     layer.fwd_method = self.method
                     # set W_next for all layers except last
@@ -95,7 +96,8 @@ class jvp_MLP(nn.Module):
             if layer.fwd_method == 'weight_perturb':
                 layer.weight.grad = jvp.sum() * layer.weight_guess
             elif layer.fwd_method in ['act_perturb',  'act_perturb-relu', 'W^T', 'CW^T', 'CW^T2',
-                                      'clip-CW^T2, layer_downstream', 'orthogonal_W^T']:
+                                      'clip-CW^T2, layer_downstream', 'orthogonal_W^T', 'orthogonal_W^T_NS']:
+
                 scaled_s_guess = (jvp.unsqueeze(-1) * layer.s_guess)
                 layer.weight.grad = (
                     (scaled_s_guess.unsqueeze(2) * layer.x_in.unsqueeze(1))
@@ -116,6 +118,8 @@ class jvp_MLP(nn.Module):
                     with torch.enable_grad():
                         x_next = F.relu(F.linear(layer.x_in, layer.weight, bias=None))
                         x_next.backward(gradient=backprop_grad)
+            else:
+                print('method not found')
 
 
 class jvp_linear(nn.Module):
@@ -127,9 +131,12 @@ class jvp_linear(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
         self.eye = torch.eye(out_size).to(device)
+        self.count = 0
         self.n = 1.0
+        self.k = 10 # used for top-k orthogonal W^T
         #bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
         #nn.init.uniform_(self.bias, -bound, bound)
+        self.spectral_norm = None
 
     def forward(self, x):
         #return F.linear(x, self.weight, self.bias)
@@ -168,10 +175,15 @@ class jvp_linear(nn.Module):
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
             return out, jvp_out
-        elif self.fwd_method in ['W^T', 'CW^T','CW^T2', 'clip-CW^T2', 'orthogonal_W^T']:
+
+        elif self.fwd_method in ['W^T', 'CW^T','CW^T2', 'clip-CW^T2', 'orthogonal_W^T', 'orthogonal_W^T_NS']:
             s_next_guess = torch.randn(x_in.shape[0], self.W_next.shape[0], device=device)
             s_next_guess# /= torch.tensor(self.n).sqrt()
             self.mask = ((F.linear(x_in, self.weight, self.bias)) > 0)
+            #plt.matshow(self.mask.to(torch.float32).clone().cpu().numpy())
+            #plt.savefig(f'plots/mask_{self.fwd_method}_layer_{self.l}')
+            #plt.close()
+            #plt.show()
             if self.fwd_method == 'W^T':
                 self.s_guess = (s_next_guess @ self.W_next) * self.mask # relu mask
                 #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
@@ -224,7 +236,7 @@ class jvp_linear(nn.Module):
                 # done
                 try: # diagonalisation does not always work
                     L, Q = torch.linalg.eigh(cov_y)
-                    if self.fwd_method == 'CW^T2':
+                    if self.fwd_method == 'clip-CW^T2':
                         L = torch.clamp(L, min=0.05)
                     self.b_eye = self.eye.unsqueeze(0).repeat(x_in.shape[0], 1, 1)
                     self.C = torch.bmm(torch.bmm(Q, torch.diag_embed(L.pow(-0.5))), Q.permute((0, 2, 1)))  # (B, out, out)
@@ -246,12 +258,15 @@ class jvp_linear(nn.Module):
                 # compute W' using svd
                 W = self.W_next @ mask
                 self.rank = int(torch.linalg.matrix_rank(W).to(torch.float32).mean())
-                print(self.rank)
+                #print(self.rank)
                 #print(self.l, self.rank)
-                #rank=int(self.n)
-                rank = min(int(torch.linalg.matrix_rank(W).to(torch.float32).mean()), 25)
+                rank=self.k
+                rank = 10
+                #rank = min(int(torch.linalg.matrix_rank(W).to(torch.float32).mean()), 15)
                 U, S, Vh = torch.linalg.svd(W, full_matrices=False)
                 self.U, self.S, self.Vh = U[:, :, :rank], S[:, :rank], Vh[:, :rank, :]
+                #self.U, self.S, self.Vh = U[:, :, -10:], S[:, -10:], Vh[:, -10:, :]
+                #print(self.U.shape, self.S.shape, self.Vh.shape)
                 # set k such that sum k sigma_k^2 = 0.99 sum r sigma_r^2
                 '''
                 threshold = 0.99 * (self.S.mean(dim=0)**2).sum()
@@ -261,25 +276,46 @@ class jvp_linear(nn.Module):
                 rank = k
                 '''
                 # only keep the orthonormal columns corresponding to nonzero singular values
+                #self.W_ = torch.bmm(torch.bmm(self.U, torch.diag_embed(self.S)), self.Vh)
                 self.W_ = torch.bmm(self.U, self.Vh)
-                #self.W_ = U[:, :rank] @ Vh[:rank, :]
-                #W_ = self.W_[0]
-                #plt.matshow((W_.T @ W_).clone().cpu().numpy())
-                #plt.savefig(f'plots/WTW_layer_{self.l}_r_{int(rank)}')
                 self.s_guess = torch.bmm(s_next_guess.unsqueeze(1), self.W_).squeeze()
-            out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
+            elif self.fwd_method == 'orthogonal_W^T_NS':
+                mask = torch.diag_embed(self.mask).to(torch.float32)
+                # compute W' using svd
+                W = self.W_next @ mask
+                self.spectral_norm = lanczos(W[0], 1)[0]
+                W_normalised = W/self.spectral_norm
+                if self.count % 50 == 0:
+                    #U, S, Vh = torch.linalg.svd(W[0], full_matrices=False)
+                    top_k_singular_vals = lanczos(W_normalised[0], self.k)
+                    #print(top_k_singular_vals[self.k - 1] / self.spectral_norm, self.spectral_norm)
+                    key = str(int(10*top_k_singular_vals[self.k-1]))
+                    with open('newton_schulz/NS_coeffs.json', 'r') as f:
+                        coeffs = json.load(f)
+                        self.coefficients = coeffs[key]
+                # get normalised singular values
+                #spectral_norm = spectral_norm_general(W)
+                #size = 512
+                #epoch = 300
+                #data = {}
+                #with open('newton_schulz/normalised_singular_values.json', 'r') as f:
+                #    data = json.load(f)
+                #with open('newton_schulz/normalised_singular_values.json', 'w') as f:
+                #    data[f'size{size}_layer{self.l}_epoch{epoch}'] = S.mean(dim=0).cpu().numpy().tolist()
+                #    json.dump(data, f)
+                # set NS coefficient
+                self.W_ = zeropower_via_newtonschulz5(W_normalised, self.coefficients, 5)
+                self.s_guess = torch.bmm(s_next_guess.unsqueeze(1), self.W_).squeeze()
+                self.count += 1
+
             jvp_out = jvp + self.s_guess
         elif self.fwd_method == 'act_perturb-relu':
             x_next_guess = torch.randn(x_in.shape[0], self.weight.shape[0])
             self.mask = ((F.linear(x_in, self.weight, bias=None)) > 0)
             self.s_guess = x_next_guess * self.mask # relu mask
-            #print((torch.prod(torch.tensor(self.s_guess.shape)).sqrt()), (torch.prod(torch.tensor(x_in.shape)).sqrt()))
-            #self.s_guess = self.s_guess*(torch.prod(torch.tensor(self.s_guess.shape)).sqrt())/self.s_guess.norm()
             self.s_guess = self.s_guess #* (torch.tensor(self.s_guess.shape[1], dtype=torch.float32).sqrt()) / ((self.s_guess**2).sum(dim=1).sqrt()).unsqueeze(-1)
-            #self.s_guess = self.s_guess * (0.001) / self.s_guess.norm()
             out, jvp = fc.jvp(self.act_fwd, (x_in,), (jvp_in,))
             jvp_out = jvp + self.s_guess
-        #print(self.fwd_method)
         return out, jvp_out
 
 class jvp_loss(nn.Module):

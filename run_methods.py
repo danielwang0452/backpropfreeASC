@@ -93,7 +93,7 @@ def act_perturb(methods, n_epochs):
     size = 128
     model = jvp_MLP(in_size=torch.prod(torch.tensor(train_dataset[0][0].shape)),
                 out_size=10, hidden_size=[size, size, size])
-    #model.load_state_dict(torch.load(f'model_checkpoints/W^T_128_300*'))
+    #model.load_state_dict(torch.load(f'model_checkpoints/W^T_512_299'))
     model_backprop = copy.deepcopy(model)
     model_backprop.to(device)
     model.to(device)
@@ -108,7 +108,6 @@ def act_perturb(methods, n_epochs):
     test_accuracies = []
     train_losses = []
     train_accuracies = []
-    model.eval()
     with torch.no_grad():
         for epoch in range(n_epochs):
             layer_metrics = {}
@@ -124,6 +123,7 @@ def act_perturb(methods, n_epochs):
                 train_losses.append(np.array(train_loss).mean())
                 train_accuracies.append(np.array(train_accuracy).mean())
             for b, batch in enumerate(train_dataloader):
+                model.train()
                 torch.mps.empty_cache()
                 #print(torch.mps.current_allocated_memory(), torch.mps.driver_allocated_memory())
                 x, y = batch
@@ -135,6 +135,7 @@ def act_perturb(methods, n_epochs):
                 ###
                 optimizer.zero_grad()
                 loss, jvp = model.jvp_forward(x.to(device), y.to(device))
+                #print(loss.sum())
                 # backprop
                 with torch.enable_grad():
                     out = model_backprop(x)
@@ -148,13 +149,14 @@ def act_perturb(methods, n_epochs):
                 model.set_grad(jvp)
                 # Optimizer step
                 optimizer.step()
-                layer_metrics = compute_layer_metrics(model, optimizer, x, y, methods)
-                layer_metrics[f"train_loss"] = loss.mean().cpu().numpy()
+                #layer_metrics = compute_layer_metrics(model, optimizer, x, y, methods)
+                layer_metrics[f"train_loss"] = np.array(train_loss).mean()
                 #layer_metrics[f"{model.method}_test_accuracy"] = np.array(test_accuracy).mean()
                 layer_metrics[f"W^T_train_accuracy"] = np.array(train_accuracy).mean()
                 layer_metrics[f"W^T_test_accuracy"] = np.array(test_accuracy).mean()
                 layer_metrics["backprop_train_accuracy"] = np.array(train_accuracy_b).mean()
                 layer_metrics["backprop_test_accuracy"] = np.array(test_accuracy_b).mean()
+                #print(np.array(train_accuracy_b).mean())
                 wandb.log(layer_metrics)
             if (epoch+1) % 100 == 0:
                 torch.save(model.state_dict(), f'model_checkpoints/{model.method}_{size}_{epoch}')
@@ -166,7 +168,6 @@ def act_perturb(methods, n_epochs):
         return test_losses, test_accuracies
 
 def compute_gradient(model, optimizer, x, y):
-    model.train()
     with torch.enable_grad():
         model.output_gradients = []
         optimizer.zero_grad()
@@ -188,7 +189,7 @@ def compute_gradient(model, optimizer, x, y):
         '''
         parameters_grads = {}
         for p, param in model.named_parameters():
-            if 'bias' not in p:
+            if 'weight' in p:
                 parameters_grads[p] = param.grad.detach().clone()
     #parameters_grads = {}
     #for p, param in model.named_parameters():
@@ -198,7 +199,7 @@ def compute_gradient(model, optimizer, x, y):
 
 def compute_bias(dL, layer, method, layer_num):
     assert method in ['weight_perturb', 'act_perturb',  'act_perturb-relu',
-                      'W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T']
+                      'W^T', 'CW^T', 'CW^T2', 'clip-CW^T2', 'orthogonal_W^T', 'orthogonal_W^T_NS']
     with torch.no_grad():
         if method == 'weight_perturb' or method == 'act_perturb':
             # unbiased
@@ -231,11 +232,12 @@ def compute_bias(dL, layer, method, layer_num):
             # cov_y = torch.bmm(layer.C, (mask @ cov_WT @ mask + 1e-5*layer.eye))
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
             # debugging
-        elif method == 'orthogonal_W^T':
+            # debuggingwandb
+
+
+        elif method in ['orthogonal_W^T', 'orthogonal_W^T_NS']:
             cov_y = torch.bmm(layer.W_.permute((0, 2,1 )), layer.W_)  # (B, out, out)
             bias = (dL.unsqueeze(1) @ (cov_y - layer.eye)).squeeze().mean(dim=0)  # (B, out)
-            # debugging
-           # print(torch.bmm(layer.W_.permute((0, 2, 1)), layer.W_) - cov)
         elif method == 'act_perturb-relu':
             #cov_WT = layer.W_next.T @ layer.W_next  # out, out
             mask = torch.diag_embed(layer.mask.detach()).to(torch.float32)
